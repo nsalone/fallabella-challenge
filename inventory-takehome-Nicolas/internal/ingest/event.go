@@ -10,6 +10,8 @@ import (
 const (
 	EventTypeIn  = "IN"
 	EventTypeOut = "OUT"
+
+	insufficientStockError = "insufficient stock for OUT movement"
 )
 
 type rawEvent struct {
@@ -27,6 +29,21 @@ type Event struct {
 	Quantity   int64
 	OccurredAt time.Time
 }
+
+type persistJob struct {
+	Event
+	FileName   string
+	LineNumber int64
+	RawLine    string
+}
+
+type PersistResult int
+
+const (
+	PersistInserted PersistResult = iota
+	PersistDuplicate
+	PersistRejectedInsufficientStock
+)
 
 func parseEvent(line string, knownSKUs map[string]struct{}) (Event, error) {
 	var raw rawEvent

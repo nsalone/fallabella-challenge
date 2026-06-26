@@ -30,9 +30,10 @@ type Config struct {
 }
 
 type Stats struct {
-	InvalidLines    atomic.Int64
-	InsertedEvents  atomic.Int64
-	DuplicateEvents atomic.Int64
+	InvalidLines               atomic.Int64
+	InsertedEvents             atomic.Int64
+	DuplicateEvents            atomic.Int64
+	RejectedInsufficientStock  atomic.Int64
 }
 
 func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) (Stats, error) {
@@ -58,7 +59,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) (Stats, error) {
 		return stats, nil
 	}
 
-	persistCh := make(chan Event, persistQueue)
+	persistCh := make(chan persistJob, persistQueue)
 	fileJobs := make(chan string, len(files))
 
 	var fileWG sync.WaitGroup
@@ -110,13 +111,14 @@ func logSummary(start time.Time, stats *Stats) {
 	log.Printf("Inserted: %d", stats.InsertedEvents.Load())
 	log.Printf("Duplicates: %d", stats.DuplicateEvents.Load())
 	log.Printf("Invalid: %d", stats.InvalidLines.Load())
+	log.Printf("Rejected insufficient stock: %d", stats.RejectedInsufficientStock.Load())
 }
 
 func processFiles(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	fileJobs <-chan string,
-	persistCh chan<- Event,
+	persistCh chan<- persistJob,
 	knownSKUs map[string]struct{},
 	stats *Stats,
 ) {
@@ -137,7 +139,7 @@ func processFile(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	filePath string,
-	persistCh chan<- Event,
+	persistCh chan<- persistJob,
 	knownSKUs map[string]struct{},
 	stats *Stats,
 ) error {
@@ -179,7 +181,12 @@ func processFile(
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case persistCh <- event:
+		case persistCh <- persistJob{
+			Event:      event,
+			FileName:   fileName,
+			LineNumber: lineNumber,
+			RawLine:    line,
+		}:
 		}
 	}
 
@@ -191,32 +198,46 @@ func processFile(
 	return nil
 }
 
-func persistEvents(ctx context.Context, pool *pgxpool.Pool, persistCh <-chan Event, stats *Stats) {
-	for event := range persistCh {
+func persistEvents(ctx context.Context, pool *pgxpool.Pool, persistCh <-chan persistJob, stats *Stats) {
+	for job := range persistCh {
 		if err := ctx.Err(); err != nil {
 			return
 		}
 
-		inserted, err := persistEvent(ctx, pool, event)
+		result, err := persistEvent(ctx, pool, job)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("persist event %s failed: %v", event.EventID, err)
+			log.Printf("persist event %s failed: %v", job.EventID, err)
 			continue
 		}
-		if inserted {
+
+		switch result {
+		case PersistInserted:
 			stats.InsertedEvents.Add(1)
-		} else {
+		case PersistDuplicate:
 			stats.DuplicateEvents.Add(1)
+		case PersistRejectedInsufficientStock:
+			stats.RejectedInsufficientStock.Add(1)
+			if recordErr := recordIngestionError(
+				ctx, pool, job.FileName, job.LineNumber, job.RawLine, insufficientStockError,
+			); recordErr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("record insufficient stock error for %s: %v", job.EventID, recordErr)
+			}
 		}
 	}
 }
 
-func persistEvent(ctx context.Context, pool *pgxpool.Pool, event Event) (bool, error) {
+func persistEvent(ctx context.Context, pool *pgxpool.Pool, job persistJob) (PersistResult, error) {
+	event := job.Event
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("begin transaction: %w", err)
+		return 0, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
 
@@ -229,28 +250,39 @@ func persistEvent(ctx context.Context, pool *pgxpool.Pool, event Event) (bool, e
 	`, event.EventID, event.SKU, event.Type, event.Quantity, event.OccurredAt).Scan(&insertedEventID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return false, nil
+			return PersistDuplicate, nil
 		}
-		return false, fmt.Errorf("insert movement: %w", err)
+		return 0, fmt.Errorf("insert movement: %w", err)
 	}
 
-	delta := event.Quantity
 	if event.Type == EventTypeOut {
-		delta = -event.Quantity
-	}
-
-	if _, err := tx.Exec(ctx, `
-		UPDATE current_stock
-		SET quantity = quantity + $1
-		WHERE sku = $2
-	`, delta, event.SKU); err != nil {
-		return false, fmt.Errorf("update current stock: %w", err)
+		var remainingQuantity int64
+		err = tx.QueryRow(ctx, `
+			UPDATE current_stock
+			SET quantity = quantity - $1
+			WHERE sku = $2 AND quantity >= $1
+			RETURNING quantity
+		`, event.Quantity, event.SKU).Scan(&remainingQuantity)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return PersistRejectedInsufficientStock, nil
+			}
+			return 0, fmt.Errorf("update current stock: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE current_stock
+			SET quantity = quantity + $1
+			WHERE sku = $2
+		`, event.Quantity, event.SKU); err != nil {
+			return 0, fmt.Errorf("update current stock: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit transaction: %w", err)
+		return 0, fmt.Errorf("commit transaction: %w", err)
 	}
-	return true, nil
+	return PersistInserted, nil
 }
 
 func recordIngestionError(ctx context.Context, pool *pgxpool.Pool, fileName string, lineNumber int64, rawLine, message string) error {

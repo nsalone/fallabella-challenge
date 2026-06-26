@@ -39,7 +39,32 @@ The specification defines stock as the result of applying all valid movements (`
 
 The spec does **not** state that an `OUT` movement causing negative stock is invalid. Preventing negative stock would be a business rule on top of the given requirements.
 
-If that rule were required, I would enforce it atomically in the stock update (for example, `UPDATE ... WHERE quantity + delta >= 0` and treat zero rows updated as a rejected movement).
+If that rule were required, I would enforce it atomically in the stock update (for example, `UPDATE ... WHERE quantity >= requested_quantity` and treat zero rows updated as a rejected movement).
+
+## Alternative implementation: reject negative stock
+
+I also implemented and validated an **alternative business rule** in a separate branch.
+
+- The original implementation allows negative stock because the specification defines stock as the result of applying all valid inventory movements and does not explicitly state that an `OUT` movement should be rejected when stock is insufficient.
+- In many real inventory systems, preventing negative stock is a common business rule.
+- To validate this alternative interpretation, I implemented a version where an `OUT` movement is rejected if it would make the stock negative.
+- The validation is performed atomically inside the same database transaction using an `UPDATE ... WHERE quantity >= requested_quantity`.
+- If there is not enough stock:
+  - the movement is not persisted,
+  - the transaction is rolled back,
+  - the event is recorded in `ingestion_errors`,
+  - processing continues normally.
+
+Results obtained with the sample dataset:
+
+| Metric | Value |
+|---|---|
+| Inserted | 1,926 |
+| Duplicates | 175 |
+| Invalid | 81 |
+| Rejected (insufficient stock) | 87 |
+
+> This implementation is maintained as an alternative branch because the specification does not explicitly require non-negative stock. Both implementations are valid depending on whether inventory movements are interpreted as immutable events or as business commands that must be validated before being accepted.
 
 ## 4. API design
 
