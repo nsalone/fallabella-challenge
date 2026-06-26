@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: takehome-postgres
+    environment:
+      POSTGRES_USER: takehome
+      POSTGRES_PASSWORD: takehome
+      POSTGRES_DB: inventory
+    ports:
+      - "5438:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U takehome -d inventory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - takehome_pgdata:/var/lib/postgresql/data
+
+  ingest:
+    build:
+      context: ./inventory-takehome-Nicolas
+    container_name: inventory-ingest
+    environment:
+      DATABASE_URL: postgres://takehome:takehome@postgres:5432/inventory?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ./api-server
+    container_name: inventory-api
+    environment:
+      DATABASE_URL: postgres://takehome:takehome@postgres:5432/inventory?sslmode=disable
+      ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  front:
+    build:
+      context: ./inventory-front
+      args:
+        VITE_API_BASE_URL: http://localhost:8080
+    container_name: inventory-front
+    ports:
+      - "5174:80"
+    restart: unless-stopped
+
+volumes:
+  takehome_pgdata:
