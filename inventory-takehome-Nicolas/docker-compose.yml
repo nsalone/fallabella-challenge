@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: takehome-postgres
+    environment:
+      POSTGRES_USER: takehome
+      POSTGRES_PASSWORD: takehome
+      POSTGRES_DB: inventory
+    ports:
+      - "5438:5432"
+    # The connection pool size of 10 mentioned in the README is a property your
+    # application must respect on its side; this container itself allows more.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U takehome -d inventory"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - takehome_pgdata:/var/lib/postgresql/data
+
+volumes:
+  takehome_pgdata:
